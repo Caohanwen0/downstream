@@ -1,5 +1,7 @@
 import os, csv, logging
 
+from utils import *
+
 def parse_data(args, type):
     category = args.dataset_name.split("/")[0]
     datasetname = args.dataset_name.split("/")[1]
@@ -16,8 +18,8 @@ def parse_data(args, type):
                 "positive" : 0,
                 "neutral" : 1,
                 "negative" : 2}
-            for line in lines:
-                texts.append(line.split("	")[0])
+            for step, line in enumerate(lines):
+                texts.append(preprocess_clean(line.split("	")[0]))
                 label = label_to_int[line.split("	")[1].strip("\n")]
                 labels.append(label)
         elif datasetname == "twitter_US_airline_dataset":
@@ -27,7 +29,7 @@ def parse_data(args, type):
                 "negative" : 2
             }
             for line in lines:
-                texts.append(line.split("	")[0])
+                texts.append(preprocess_clean(line.split("	")[0]))
                 label = label_to_int[line.split("	")[1].strip("\n")]
                 labels.append(label)
         elif datasetname == "NewsMTSC":
@@ -37,7 +39,7 @@ def parse_data(args, type):
                 for step, row in enumerate(csvreader):
                     if step == 0:
                         continue
-                    texts.append(row[1])
+                    texts.append(preprocess_clean(row[1]))
                     if int(row[-1]) == 1:
                         labels.append(2)
                     elif int(row[-2]) == 1:
@@ -56,7 +58,7 @@ def parse_data(args, type):
                 "joy":3
             }
             for line in lines:
-                texts.append(line.split("	")[0])
+                texts.append(preprocess_clean(line.split("	")[0]))
                 label = label_to_int[line.split("	")[1].strip("\n")]
                 labels.append(label)
     elif category == "stance":
@@ -67,7 +69,7 @@ def parse_data(args, type):
                 for step, row in enumerate(csvreader):
                     if step == 0:
                         continue
-                    texts.append(row[2])
+                    texts.append(preprocess_clean(row[2]))
                     if int(row[-1]) == 1:
                         labels.append(1)
                     elif int(row[-2]) == 1:
@@ -79,16 +81,67 @@ def parse_data(args, type):
                         exit(1) 
     elif category == "offensive":
         if datasetname == "reddit_incivility":
-            pass    
+            # incivility : 1 , not-incivility: 0
+            with open(os.path.join(args.dataset_path, args.dataset_name, f"{type}.csv")) as fin:
+                csvreader = csv.reader(fin)
+                for step, row in enumerate(csvreader):
+                    if step == 0:
+                        continue
+                    texts.append(preprocess_clean(row[1]))
+                    try:
+                        labels.append(int(row[-1]))
+                    except:
+                        logging.warning(f"An error had occuredat at line  : {row}")
+        elif datasetname == "OLID":
+            label_to_int = {
+                "NOT": 0,
+                "OFF" :1
+            }
+            for line in lines:
+                line = line.split("	")
+                texts.append(preprocess_clean(line[0])) 
+                labels.append(label_to_int[line[1].strip("\n")])
+        elif datasetname == "COLD":
+            with open(os.path.join(args.dataset_path, args.dataset_name, f"{type}.csv")) as fin:
+                csvreader = csv.reader(fin)
+                for step, row in enumerate(csvreader):
+                    if step == 0:
+                        continue
+                    texts.append(preprocess_clean(row[1]))
+                    try:
+                        false_label = int(row[2]) # non-offensive
+                        true_label = int(row[3])
+                        assert false_label + true_label == 1
+                        labels.append(true_label)
+                    except:
+                        logging.warning(f"An error had occuredat at line  : {row}")
+        
+    elif category == "rumor":
+        if datasetname == "Weibo20":
+            with open(os.path.join(args.dataset_path, args.dataset_name, f"{type}.csv")) as fin:
+                csvreader = csv.reader(fin)
+                for step, row in enumerate(csvreader):
+                    if step == 0:
+                        continue
+                    texts.append(preprocess_clean(row[1]))
+                    try:
+                        false_label = int(row[2])
+                        true_label = int(row[3])
+                        assert false_label + true_label == 1
+                        labels.append(true_label)
+                    except:
+                        logging.warning(f"An error had occuredat at line  : {row}")
+        
+    assert len(texts) == len(labels)
     return texts, labels
 
-# class MyArgs:
-#     def __init__(self):
-#         self.dataset_path = "datasets"
-#         self.dataset_name = "stance/semeval2016task6"
+class MyArgs:
+    def __init__(self):
+        self.dataset_path = "datasets"
+        self.dataset_name = "offensive/OLID"
     
 
-# if __name__ == "__main__":
-#     args = MyArgs()
-#     t, l = parse_data(args, "train")
-#     print(f"Dataset size : {len(t)}")
+if __name__ == "__main__":
+    args = MyArgs()
+    t, l = parse_data(args, "train")
+    print(f"Dataset size : {len(t)}")

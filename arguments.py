@@ -51,7 +51,7 @@ def add_training_args(parser: argparse.ArgumentParser):
     group.add_argument('--seed', type=int, default=42,
                        help='random seed for reproducibility')
 
-    group.add_argument('--epochs', type=int, default=1,
+    group.add_argument('--epochs', type=int, default=30,
                        help='total number of epochs to train over all training runs')
 
     # Learning rate.
@@ -59,7 +59,7 @@ def add_training_args(parser: argparse.ArgumentParser):
                        help='initial learning rate')
     group.add_argument('--weight-decay', type=float, default=1.0e-2,
                        help='weight-decay')
-    group.add_argument('--loss-scale', type=float, default=524288,
+    group.add_argument('--loss-scale', type=float, default=1,
                        help='loss scale')
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay LR over,'

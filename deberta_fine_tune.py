@@ -1,5 +1,5 @@
 import torch, os, json, csv
-os.environ['CUDA_VISIBLE_DEVICES'] = "7"
+#os.environ['CUDA_VISIBLE_DEVICES'] = "0,1"
 import bmtrain as bmt
 from cmath import inf
 from model_center.model import Roberta,RobertaConfig
@@ -9,6 +9,7 @@ from model_center.dataset import DistributedDataLoader
 from model_center.dataset import MMapIndexedDataset, DistributedMMapIndexedDataset, DistributedDataLoader
 from model_center.tokenizer import BertTokenizer, RobertaTokenizer
 from model_center.utils import print_inspect
+from transformers import AutoModelForSequenceClassification, AutoModel
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
 from torch.utils.data import TensorDataset, Dataset
@@ -51,57 +52,32 @@ label_num = len(set(test_labels))
 bmt.print_rank(f"Train size: {len(train_labels)} | Val size: {len(val_labels)} | Test size: {len(test_labels)}")
 bmt.print_rank(f"Fine-tuning: {label_num} class classification...")
 
-class MyRobertaModel(torch.nn.Module):
-    def __init__(self, config):
+class MyModel(torch.nn.Module):
+    def __init__(self):
         super().__init__()
-        if args.checkpoint is not None:
-            bmt.print_rank(f"Initializing bert from pretrained {args.checkpoint}...")
-            self.roberta = Roberta.from_pretrained(args.checkpoint) # load roberta from pretrained
-        else: 
-            assert args.load is not None
-            bmt.print_rank(f"Initializing roberta from our model path {args.load}...")
-            self.roberta = Roberta(config)
-            bmt.load(self.roberta, args.load, strict = False)
-        # print_inspect(self.roberta, "*")
-        self.dense = Linear(config.dim_model, label_num)
+        assert args.checkpoint is not None
+        bmt.print_rank(f"Initializing backbone model from pretrained {args.checkpoint}...")
+        huggingface_model = AutoModel.from_pretrained(args.checkpoint)
+        self.backbone = bmt.BMTrainModelWrapper(huggingface_model)
+        self.dense = Linear(self.backbone.config.hidden_size, label_num)
         bmt.init_parameters(self.dense) # init dense layer
 
-    def reload(self, config):
-        super().__init__()
-        if args.checkpoint is not None:
-            bmt.print_rank(f"Initializing bert from pretrained {args.checkpoint}...")
-            self.roberta = Roberta.from_pretrained(args.checkpoint) # load roberta from pretrained
-        else: 
-            assert args.load is not None
-            bmt.print_rank(f"Initializing bert from our model path {args.load}...")
-            self.roberta = Roberta(config)
-            bmt.load(self.roberta, args.load)
-        print_inspect(self.roberta, "*")
-        self.dense = Linear(config.dim_model, label_num)
-        bmt.init_parameters(self.dense) # init dense layer 
-
     def forward(self, input_ids, attention_mask):
-        pooler_output = self.roberta(input_ids=input_ids, attention_mask=attention_mask).pooler_output
+        pooler_output = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[0].type(torch.float16)
         logits = self.dense(pooler_output)
         return logits
 
 def get_model():
-    config = RobertaConfig.from_json_file(args.model_config)
-    roberta_model = MyRobertaModel(config)
-    return roberta_model
+    huggingface_model = AutoModelForSequenceClassification.from_pretrained(args.checkpoint, num_labels = label_num,
+        ignore_mismatched_sizes=True)
+    model = bmt.BMTrainModelWrapper(huggingface_model)
     return model
 
 model = get_model()
 bmt.synchronize()
 
 def get_tokenizer():
-    tokenizer_obj = Tokenizer.from_file(os.path.join(args.base_path, "downstream", args.tokenizer))
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object = tokenizer_obj)
-    tokenizer.pad_token = '<pad>'
-    tokenizer.eos_token = '</s>'
-    tokenizer.sep_token = '<s>'
-    tokenizer.unk_token = '<unk>'
-    tokenizer.mask_token = '<mask>'
+    tokenizer = tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
     return tokenizer
 
 tokenizer = get_tokenizer()
@@ -190,31 +166,36 @@ def get_last_epoch():
 def fine_tune():
     best_valid_acc = 0
     global_step = 0
+    early_stopping = 0
     last_epoch = get_last_epoch()
     for epoch in range(last_epoch + 1, args.epochs):
         bmt.print_rank("Epoch {} begin...".format(epoch + 1))
         model.train()
         for step, data in enumerate(train_dataloader):
             global_step += 1
-            optim_manager.zero_grad() # calling zero_grad for each optimizer
+            if global_step % args.gradient_accumulate == 1:
+                optim_manager.zero_grad() # calling zero_grad for each optimizer
             input_ids, attention_mask, labels = data
             # load to cuda
             input_ids = input_ids.cuda()
             attention_mask = attention_mask.cuda()
             labels = labels.cuda()
-            logits = model(input_ids, attention_mask)
-            loss = loss_func(logits.view(-1, logits.shape[-1]), labels.view(-1))
+            outputs = model(input_ids, attention_mask, labels = labels)
+            #loss = loss_func(logits.view(-1, logits.shape[-1]), labels.view(-1))
+            loss = outputs.loss
             global_loss = bmt.sum_loss(loss).item()
             if bmt.rank() == 0:
                 if args.save_tensorboard == True:
                     writer.add_scalar(f"Loss/train", global_loss, global_step)
             # loss = optimizer.loss_scale(loss)
             # loss.backward()
+            loss = loss / args.gradient_accumulate
             optim_manager.backward(loss)
-            grad_norm = optim_manager.clip_grad_norm(optimizer.param_groups, max_norm = 1.0 , norm_type = 2)
-            optim_manager.step()
+            if global_step % args.gradient_accumulate == 0:
+                grad_norm = optim_manager.clip_grad_norm(optimizer.param_groups, max_norm = 1.0 , norm_type = 2)
+                optim_manager.step()
             # bmt.optim_step(optimizer, lr_scheduler)
-            if step % args.log_iters == 0:
+            if step % args.log_iters == 0 and (not step == 0):
                 bmt.print_rank(
                     "Loss: {:.4f} | Scale: {:10.4f} | Grad_norm: {:.4f} | Lr: {:.4e}".format(
                         global_loss,
@@ -233,8 +214,10 @@ def fine_tune():
                 input_ids = input_ids.cuda()
                 attention_mask = attention_mask.cuda()
                 labels = labels.cuda()
-                logits = model(input_ids, attention_mask)
-                loss = loss_func(logits.view(-1, logits.shape[-1]), labels.view(-1))                
+                output = model(input_ids, attention_mask, labels = labels)
+                #loss = loss_func(logits.view(-1, logits.shape[-1]), labels.view(-1))                
+                loss = output.loss
+                logits = output.logits
                 logits = logits.argmax(dim=-1)
                 pd.extend(logits.cpu().tolist())
                 gt.extend(labels.cpu().tolist())
@@ -273,8 +256,10 @@ def check_performance(last_epoch):
             input_ids = input_ids.cuda()
             attention_mask = attention_mask.cuda()
             labels = labels.cuda()
-            logits = model(input_ids, attention_mask)
-            loss = loss_func(logits.view(-1, logits.shape[-1]), labels.view(-1))
+            output = model(input_ids, attention_mask, labels = labels)
+            logits = output.logits
+            loss = output.loss
+            #loss = loss_func(logits.view(-1, logits.shape[-1]), labels.view(-1))
             logits = logits.argmax(dim=-1)
 
             pd.extend(logits.cpu().tolist())
