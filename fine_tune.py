@@ -1,5 +1,5 @@
 import torch, os, json, csv
-os.environ['CUDA_VISIBLE_DEVICES'] = "7"
+#os.environ['CUDA_VISIBLE_DEVICES'] = "0,1"
 import bmtrain as bmt
 from cmath import inf
 from model_center.model import Roberta,RobertaConfig
@@ -7,8 +7,9 @@ from model_center.layer import Linear
 from model_center.dataset.bertdataset import DATASET
 from model_center.dataset import DistributedDataLoader
 from model_center.dataset import MMapIndexedDataset, DistributedMMapIndexedDataset, DistributedDataLoader
-from model_center.tokenizer import BertTokenizer, RobertaTokenizer
+from model_center.tokenizer import RobertaTokenizer
 from model_center.utils import print_inspect
+from transformers import AutoModelForSequenceClassification, AutoModel
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
 from torch.utils.data import TensorDataset, Dataset
@@ -32,6 +33,7 @@ def initialize():
     # init save folder
     if args.save != None:
         os.makedirs(args.save , exist_ok=True)
+    bmt.print_rank(args)
     return args
 
 args = initialize()
@@ -55,7 +57,7 @@ class MyRobertaModel(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         if args.checkpoint is not None:
-            bmt.print_rank(f"Initializing bert from pretrained {args.checkpoint}...")
+            bmt.print_rank(f"Initializing roberta from pretrained {args.checkpoint}...")
             self.roberta = Roberta.from_pretrained(args.checkpoint) # load roberta from pretrained
         else: 
             assert args.load is not None
@@ -89,20 +91,21 @@ def get_model():
     config = RobertaConfig.from_json_file(args.model_config)
     roberta_model = MyRobertaModel(config)
     return roberta_model
-    return model
+
 
 model = get_model()
 bmt.synchronize()
 
 def get_tokenizer():
-    tokenizer_obj = Tokenizer.from_file(os.path.join(args.base_path, "downstream", args.tokenizer))
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object = tokenizer_obj)
-    tokenizer.pad_token = '<pad>'
-    tokenizer.eos_token = '</s>'
-    tokenizer.sep_token = '<s>'
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=args.tokenizer)
+    tokenizer.add_special_tokens({'pad_token': '<pad>'})
     tokenizer.unk_token = '<unk>'
     tokenizer.mask_token = '<mask>'
+    tokenizer.cls_token = '<s>'
+    tokenizer.sep_token = '<\s>'
+    #tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer)
     return tokenizer
+
 
 tokenizer = get_tokenizer()
 
@@ -168,10 +171,12 @@ def remove_last_save_model():
     for filename in l:
         if filename[:11] == "checkpoint-":
             if os.path.isfile(os.path.join(args.save, filename)):
-                os.remove(os.path.join(args.save, filename))
-                bmt.print_rank(f"Removing previous checkpoint {filename}...")
+                if bmt.rank() == 0:
+                    os.remove(os.path.join(args.save, filename))
+                    bmt.print_rank(f"Removing previous checkpoint {filename}...")
 
 def get_last_epoch():
+    return 0
     l = os.listdir(args.save)
     last_epoch = -1
     load = False
@@ -190,13 +195,17 @@ def get_last_epoch():
 def fine_tune():
     best_valid_acc = 0
     global_step = 0
-    last_epoch = get_last_epoch()
+    early_stopping = 0
+    last_epoch = -1
+    remove_last_save_model()
+    # last_epoch = get_last_epoch()
     for epoch in range(last_epoch + 1, args.epochs):
         bmt.print_rank("Epoch {} begin...".format(epoch + 1))
         model.train()
         for step, data in enumerate(train_dataloader):
             global_step += 1
-            optim_manager.zero_grad() # calling zero_grad for each optimizer
+            if global_step % args.gradient_accumulate == 1:
+                optim_manager.zero_grad() # calling zero_grad for each optimizer
             input_ids, attention_mask, labels = data
             # load to cuda
             input_ids = input_ids.cuda()
@@ -210,11 +219,13 @@ def fine_tune():
                     writer.add_scalar(f"Loss/train", global_loss, global_step)
             # loss = optimizer.loss_scale(loss)
             # loss.backward()
+            loss = loss / args.gradient_accumulate
             optim_manager.backward(loss)
-            grad_norm = optim_manager.clip_grad_norm(optimizer.param_groups, max_norm = 1.0 , norm_type = 2)
-            optim_manager.step()
+            if global_step % args.gradient_accumulate == 0:
+                grad_norm = optim_manager.clip_grad_norm(optimizer.param_groups, max_norm = 1.0 , norm_type = 2)
+                optim_manager.step()
             # bmt.optim_step(optimizer, lr_scheduler)
-            if step % args.log_iters == 0:
+            if step % args.log_iters == 0 and (not step == 0):
                 bmt.print_rank(
                     "Loss: {:.4f} | Scale: {:10.4f} | Grad_norm: {:.4f} | Lr: {:.4e}".format(
                         global_loss,
@@ -254,15 +265,25 @@ def fine_tune():
                 best_valid_acc = acc
                 bmt.print_rank("Saving the new best model...\n") # save checkpoint
                 early_stopping = 0
+                remove_last_save_model()
                 bmt.save(model, os.path.join(args.save,  f'checkpoint-{epoch}.pt'))
             if early_stopping == 5:
                 bmt.print_rank("Accuracy have not rising for 5 epochs. Early stopping..")
-                return epoch
                 break # break for iter
-    return args.epochs - 1 # train to the last epoch
 
-def check_performance(last_epoch):
-    bmt.load(model, os.path.join(args.save, f'checkpoint-{last_epoch}.pt'))
+def load_saved_model():
+    l = os.listdir(args.save)
+    for filename in l:
+        if filename[:11] == "checkpoint-":
+            if os.path.isfile(os.path.join(args.save, filename)):
+                bmt.load(model, os.path.join(args.save, filename))
+                return True
+    return False 
+
+def check_performance():
+    load_succeed = load_saved_model()
+    if not load_succeed:
+        exit(1)
     bmt.synchronize()
     bmt.print_rank(f"Checking performance of dataset {args.dataset_name} with learning rate {args.lr}...\n")
     with torch.no_grad():
@@ -288,5 +309,5 @@ def check_performance(last_epoch):
 
 
 if __name__ == "__main__":
-    epoch_num = fine_tune()
-    check_performance(epoch_num)
+    # epoch_num = fine_tune()
+    check_performance()
